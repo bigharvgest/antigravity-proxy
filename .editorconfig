@@ -24,3 +24,9 @@ charset=utf-8-bom
 # C/C++ code formatting
 [*.{c,h}]
 cpp_space_pointer_reference_alignment = right
+
+# PowerShell scripts should keep UTF-8 BOM for Windows PowerShell 5.1 compatibility.
+[*.ps1]
+charset = utf-8-bom
+end_of_line = crlf
+insert_final_newline = true

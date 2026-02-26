@@ -1,4 +1,4 @@
-# ============================================================
+﻿# ============================================================
 #  Antigravity-Proxy 编译脚本
 #  PowerShell Build Script for Windows
 # ============================================================
@@ -183,9 +183,13 @@ try {
 
     # 处理项目目录迁移后的旧缓存：自动清理并重试一次
     if ($cmakeFailed) {
-        $cmakeText = ($cmakeResult | Out-String)
-        $isCacheMismatch = $cmakeText -match "CMakeCache\.txt directory .* is different than the directory" -or
-                          $cmakeText -match "does not match the source .* used to generate cache"
+        # 兼容 Windows PowerShell 5.1:
+        # - 2>&1 可能返回 ErrorRecord 而非纯字符串
+        # - 输出可能按控制台宽度换行，导致关键句子被拆断
+        $cmakeText = (($cmakeResult | ForEach-Object { $_.ToString() }) -join "`n")
+        $cmakeTextNormalized = [regex]::Replace($cmakeText, "\s+", " ")
+        $isCacheMismatch = $cmakeTextNormalized -match "CMakeCache\.txt directory .* is different than the directory" -or
+                          $cmakeTextNormalized -match "does not match the source .* used to generate cache"
 
         if ($isCacheMismatch) {
             Pop-Location
