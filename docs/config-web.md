@@ -4,9 +4,9 @@
 
 - **源码（开发态）**：`resources/config-web/index.html`
 - **构建输出（用户可直接打开）**：`output/config-web.html`
-  - 由 `build.ps1` 在生成 `使用说明.md` 后复制得到（见 `build.ps1` L502-L513）
+  - 由 `build.ps1` 在生成 `使用说明.md` 后复制得到（Step 10）
 - **Release 资产**：Release workflow 打包的是 `output/*`，因此 zip 内会包含 `config-web.html`
-  - `.github/workflows/release.yml` 在 `Compress-Archive` 前做了兜底复制与校验（见 `.github/workflows/release.yml` L84-L105）
+  - `.github/workflows/release.yml` 在 `Compress-Archive` 前做了兜底复制与校验
 
 ## 使用方式（无需服务端）
 
@@ -67,13 +67,13 @@
 ## 导入/导出行为
 
 - **导入**：读取 JSON → 归一化（枚举小写、缺省字段补齐、数值范围防御性回退）
-  - 对应实现：`resources/config-web/index.html` 中 `normalizeForm()`（见 L1314-L1428）
+  - 对应实现：`resources/config-web/index.html` 中 `normalizeForm()`
 - **导出**：以导入的原始 JSON 为底（保留未知字段），再“对象级覆盖”已知字段，最后 `JSON.stringify(..., null, 2)` 导出
-  - 对应实现：`exportObject()`（见 `resources/config-web/index.html` L1445-L1502）
+  - 对应实现：`exportObject()`
 
 ## 实时校验规则（前端）
 
-校验集中在 `validateAll()`（见 `resources/config-web/index.html` L1505-L1677），重点包括：
+校验集中在 `validateAll()`，重点包括：
 
 - **端口**：
   - `proxy.port`：允许 `0-65535`，其中 `0` 表示禁用代理（后端确有该语义）
@@ -86,8 +86,8 @@
 
 ## 构建/发布集成说明
 
-- `build.ps1`：新增 Step 10 复制配置工具到 `output/config-web.html`（`build.ps1` L502-L513）
-- `release.yml`：在打包前兜底复制并在缺失时失败（`.github/workflows/release.yml` L84-L105）
+- `build.ps1`：Step 10 复制配置工具到 `output/config-web.html`
+- `release.yml`：在打包前兜底复制并在缺失时失败
 
 ## 已知限制/注意事项
 
@@ -101,4 +101,6 @@
 1. `defaultForm()`：新增字段默认值
 2. `normalizeForm()`：导入归一化策略（小写/回退/类型修正）
 3. `validateAll()`：新增字段校验与错误提示
+
+> 说明：当前尚未内置“自动漂移检测”脚本，仍采用人工同步。建议在每次 `Config.hpp` 字段变更后，将上述三处作为 PR Checklist 必检项。
 

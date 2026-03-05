@@ -30,7 +30,6 @@
 1.  **端口白名单 (Port Whitelist)**：仅代理指定端口（如 80, 443），其他端口默认直连。
 2.  **DNS 专用通道 (DNS Channel)**：针对 53 端口提供独立策略：
     -   **Direct (直连)**：直接透传请求，不经过代理。
-    -   **Custom (重定向)**：将目标地址篡改为指定 DNS 服务器（如 8.8.8.8），然后直连。有效防止本地 DNS 污染同时规避代理高延迟。
     -   **Proxy (代理)**：走标准代理流程（仅在明确需要时使用）。
 
 ### 2.2 详细设计
@@ -45,11 +44,7 @@ struct ProxyRules {
     // DNS (Port 53) 处理策略
     // "direct": 直连 (默认，最稳健)
     // "proxy": 走代理
-    // "custom": 重定向到 custom_dns
     std::string dns_mode = "direct"; 
-    
-    // 自定义 DNS 目标 (仅 mode="custom" 有效)
-    std::string custom_dns = "8.8.8.8";
 };
 ```
 
@@ -62,8 +57,6 @@ graph TD
     A[Hook Connect] --> B{目标端口 == 53?}
     B -- Yes --> C{DNS Mode?}
     C -- "direct" --> F[直连 (Passthrough)]
-    C -- "custom" --> D[修改目标为 Custom DNS]
-    D --> F
     C -- "proxy" --> E[执行代理握手]
     
     B -- No --> G{端口在 Allow List?}

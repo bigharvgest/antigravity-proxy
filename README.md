@@ -539,6 +539,12 @@ Get-NetAdapterBinding -ComponentID ms_tcpip6
 # 清理后重新编译
 .\build.ps1 -Clean
 
+# 输出详细编译日志
+.\build.ps1 -Verbose
+
+# CI 场景显式声明跳过测试步骤
+.\build.ps1 -SkipTests
+
 # 查看帮助
 .\build.ps1 -Help
 ```

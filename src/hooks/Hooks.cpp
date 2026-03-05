@@ -267,13 +267,13 @@ static bool TryGetSocketType(SOCKET s, int* outType) {
     return true;
 }
 
-static bool IsStreamSocket(SOCKET s) {
+// 统一 socket 类型判定入口：只读取一次 SO_TYPE，避免热路径重复 getsockopt
+// 兼容性策略：读取失败时仍按 SOCK_STREAM 处理（保持历史行为，降低误判风险）
+static int GetSocketTypeForProxyDecision(SOCKET s, bool* outKnown = nullptr) {
     int soType = 0;
-    if (!TryGetSocketType(s, &soType)) {
-        // 获取失败时不改变行为：默认认为是 SOCK_STREAM，避免引入新的兼容性风险
-        return true;
-    }
-    return soType == SOCK_STREAM;
+    const bool known = TryGetSocketType(s, &soType);
+    if (outKnown) *outKnown = known;
+    return known ? soType : SOCK_STREAM;
 }
 
 // 获取当前 socket 的 Provider CatalogEntryId，用于在多 Provider 环境下正确调用对应的 ConnectEx trampoline
@@ -546,6 +546,17 @@ static bool ShouldLogUdpProxyFail() {
     if (n < 20) return true;
     if (n == 20) {
         Core::Logger::Warn("UDP 代理失败日志过多，后续将仅在 [调试] 级别输出（避免 QUIC 重试导致日志/性能问题）");
+    }
+    return Core::Logger::IsEnabled(Core::LogLevel::Debug);
+}
+
+// connect/ConnectEx 属于高频热路径，路由日志默认做限流，避免 Info 级别大量刷盘
+static bool ShouldLogRouteDecisionInfo() {
+    static std::atomic<int> s_routeCount{0};
+    const int n = s_routeCount.fetch_add(1, std::memory_order_relaxed);
+    if (n < 200) return true;
+    if (n == 200) {
+        Core::Logger::Info("路由决策日志过多，后续将仅在 [调试] 级别输出（避免高并发场景日志 I/O 影响性能）");
     }
     return Core::Logger::IsEnabled(Core::LogLevel::Debug);
 }
@@ -914,42 +925,68 @@ static bool EnsureUdpProxyReady(
     }
 
     // 1) 确保存在 UDP Associate 控制连接 + relay 地址
+    // 性能优化：阻塞 I/O（connect/UdpAssociate）放到锁外执行，降低 g_udpProxyMtx 竞争
+    bool needCreateContext = false;
     {
         std::lock_guard<std::mutex> lock(g_udpProxyMtx);
         auto it = g_udpProxy.find(udpSock);
         if (it == g_udpProxy.end()) {
-            UdpProxyContext ctx{};
-            ctx.udpSock = udpSock;
-            ctx.createdTick = GetTickCount64();
-
-            SOCKET tcp = ConnectTcpToProxyServer(config.proxy);
-            if (tcp == INVALID_SOCKET) {
-                WSASetLastError(WSAECONNREFUSED);
-                return false;
-            }
-
-            Network::Socks5Udp::UdpAssociateResult assoc{};
-            if (!Network::Socks5Udp::UdpAssociate(tcp, nullptr, 0, &assoc)) {
-                if (fpCloseSocket) fpCloseSocket(tcp);
-                else closesocket(tcp);
-                WSASetLastError(WSAECONNREFUSED);
-                return false;
-            }
-
-            ctx.controlSock = tcp;
-            ctx.relayAddr = assoc.relayAddr;
-            ctx.relayAddrLen = assoc.relayAddrLen;
-            ctx.relayConnected = false;
-
-            g_udpProxy[udpSock] = std::move(ctx);
-            it = g_udpProxy.find(udpSock);
-        }
-
-        // 更新 default target（用于 send/WSASend 场景）
-        if (!defaultTargetHost.empty() && defaultTargetPort != 0) {
+            needCreateContext = true;
+        } else if (!defaultTargetHost.empty() && defaultTargetPort != 0) {
             it->second.defaultTargetHost = defaultTargetHost;
             it->second.defaultTargetPort = defaultTargetPort;
             it->second.hasDefaultTarget = true;
+        }
+    }
+
+    if (needCreateContext) {
+        UdpProxyContext created{};
+        created.udpSock = udpSock;
+        created.createdTick = GetTickCount64();
+
+        SOCKET tcp = ConnectTcpToProxyServer(config.proxy);
+        if (tcp == INVALID_SOCKET) {
+            WSASetLastError(WSAECONNREFUSED);
+            return false;
+        }
+
+        Network::Socks5Udp::UdpAssociateResult assoc{};
+        if (!Network::Socks5Udp::UdpAssociate(tcp, nullptr, 0, &assoc)) {
+            if (fpCloseSocket) fpCloseSocket(tcp);
+            else closesocket(tcp);
+            WSASetLastError(WSAECONNREFUSED);
+            return false;
+        }
+
+        created.controlSock = tcp;
+        created.relayAddr = assoc.relayAddr;
+        created.relayAddrLen = assoc.relayAddrLen;
+        created.relayConnected = false;
+        if (!defaultTargetHost.empty() && defaultTargetPort != 0) {
+            created.defaultTargetHost = defaultTargetHost;
+            created.defaultTargetPort = defaultTargetPort;
+            created.hasDefaultTarget = true;
+        }
+
+        SOCKET orphanControl = INVALID_SOCKET;
+        {
+            std::lock_guard<std::mutex> lock(g_udpProxyMtx);
+            auto it = g_udpProxy.find(udpSock);
+            if (it == g_udpProxy.end()) {
+                g_udpProxy[udpSock] = std::move(created);
+            } else {
+                // 并发场景下若已被其他线程初始化，复用已有上下文并关闭当前临时控制连接
+                orphanControl = created.controlSock;
+                if (!defaultTargetHost.empty() && defaultTargetPort != 0) {
+                    it->second.defaultTargetHost = defaultTargetHost;
+                    it->second.defaultTargetPort = defaultTargetPort;
+                    it->second.hasDefaultTarget = true;
+                }
+            }
+        }
+        if (orphanControl != INVALID_SOCKET) {
+            if (fpCloseSocket) fpCloseSocket(orphanControl);
+            else closesocket(orphanControl);
         }
     }
 
@@ -958,6 +995,8 @@ static bool EnsureUdpProxyReady(
     if (!connectRelay) {
         return true;
     }
+    sockaddr_storage relayForSock{};
+    int relayForSockLen = 0;
     {
         std::lock_guard<std::mutex> lock(g_udpProxyMtx);
         auto it = g_udpProxy.find(udpSock);
@@ -968,8 +1007,6 @@ static bool EnsureUdpProxyReady(
         if (it->second.relayConnected) {
             return true;
         }
-        sockaddr_storage relayForSock{};
-        int relayForSockLen = 0;
         if (!BuildUdpRelayAddrForSocketFamily(socketFamily, it->second.relayAddr, it->second.relayAddrLen, &relayForSock, &relayForSockLen)) {
             Core::Logger::Error("UDP 代理: relay 地址族不兼容, sock=" + std::to_string((unsigned long long)udpSock) +
                                 ", socketFamily=" + std::to_string(socketFamily) +
@@ -977,24 +1014,40 @@ static bool EnsureUdpProxyReady(
             WSASetLastError(WSAEAFNOSUPPORT);
             return false;
         }
+    }
 
-        int rc = fpConnect ? fpConnect(udpSock, (sockaddr*)&relayForSock, relayForSockLen)
-                           : connect(udpSock, (sockaddr*)&relayForSock, relayForSockLen);
-        if (rc != 0) {
-            int err = WSAGetLastError();
+    int rc = fpConnect ? fpConnect(udpSock, (sockaddr*)&relayForSock, relayForSockLen)
+                       : connect(udpSock, (sockaddr*)&relayForSock, relayForSockLen);
+    if (rc != 0) {
+        const int err = WSAGetLastError();
+        // 并发场景下可能已被其它线程先 connect，WSAEISCONN 视为成功
+        if (err != WSAEISCONN) {
             Core::Logger::Error("UDP 代理: connect relay 失败, sock=" + std::to_string((unsigned long long)udpSock) +
                                 ", WSA错误码=" + std::to_string(err));
             WSASetLastError(err);
             return false;
         }
+    }
 
-        // 仅在首次 connect relay 时输出，避免刷屏
+    bool newlyConnected = false;
+    {
+        std::lock_guard<std::mutex> lock(g_udpProxyMtx);
+        auto it = g_udpProxy.find(udpSock);
+        if (it == g_udpProxy.end()) {
+            WSASetLastError(WSAECONNREFUSED);
+            return false;
+        }
+        newlyConnected = !it->second.relayConnected;
+        it->second.relayConnected = true;
+    }
+
+    // 仅在首次 connect relay 时输出，避免刷屏
+    if (newlyConnected) {
         const std::string relayStr = SockaddrToString((sockaddr*)&relayForSock);
         Core::Logger::Info("UDP 代理 relay 已连接, sock=" + std::to_string((unsigned long long)udpSock) +
                            (relayStr.empty() ? "" : (", relay=" + relayStr)));
-        it->second.relayConnected = true;
-        return true;
     }
+    return true;
 }
 
 static bool TryGetUdpProxyDefaultTarget(SOCKET s, std::string* outHost, uint16_t* outPort) {
@@ -1286,20 +1339,26 @@ static bool DoProxyHandshake(SOCKET s, const std::string& host, uint16_t port) {
     }
 
     auto& config = Core::Config::Instance();
+    // 握手预算采用 connect/send/recv 的总和，避免多阶段各自完整超时导致整体阻塞过长
+    int handshakeBudgetMs = config.timeout.connect_ms + config.timeout.send_ms + config.timeout.recv_ms;
+    if (handshakeBudgetMs <= 0) {
+        handshakeBudgetMs = 5000;
+    }
     if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
         Core::Logger::Debug("代理握手: 开始, sock=" + std::to_string((unsigned long long)s) +
                             ", type=" + config.proxy.type +
-                            ", 目标=" + host + ":" + std::to_string(port));
+                            ", 目标=" + host + ":" + std::to_string(port) +
+                            ", 预算=" + std::to_string(handshakeBudgetMs) + "ms");
     }
     if (config.proxy.type == "socks5") {
-        if (!Network::Socks5Client::Handshake(s, host, port)) {
+        if (!Network::Socks5Client::Handshake(s, host, port, handshakeBudgetMs)) {
             Core::Logger::Error("SOCKS5 握手失败, sock=" + std::to_string((unsigned long long)s) +
                                 ", 目标=" + host + ":" + std::to_string(port));
             WSASetLastError(WSAECONNREFUSED);
             return false;
         }
     } else if (config.proxy.type == "http") {
-        if (!Network::HttpConnectClient::Handshake(s, host, port)) {
+        if (!Network::HttpConnectClient::Handshake(s, host, port, handshakeBudgetMs)) {
             Core::Logger::Error("HTTP CONNECT 握手失败, sock=" + std::to_string((unsigned long long)s) +
                                 ", 目标=" + host + ":" + std::to_string(port));
             WSASetLastError(WSAECONNREFUSED);
@@ -1756,57 +1815,58 @@ int PerformProxyConnect(SOCKET s, const struct sockaddr* name, int namelen, bool
     }
     
     // 仅对 TCP (SOCK_STREAM) 做代理，避免误伤 UDP/QUIC 等
-    if (config.proxy.port != 0 && !IsStreamSocket(s)) {
-        int soType = 0;
-        TryGetSocketType(s, &soType);
+    if (config.proxy.port != 0) {
+        const int soType = GetSocketTypeForProxyDecision(s);
+        if (soType != SOCK_STREAM) {
 
-        if (soType == SOCK_DGRAM) {
-            // UDP 强阻断：默认阻断 UDP（除 DNS/loopback 例外），强制应用回退到 TCP 再走代理
-            // 设计意图：解决国内环境 QUIC/HTTP3(UDP) 绕过代理导致“看似已建隧道但仍不可用”的问题。
-            if (config.rules.udp_mode == "block") {
-                uint16_t dstPort = 0;
-                const bool hasPort = TryGetSockaddrPort(name, &dstPort);
-                const bool allowUdp = IsSockaddrLoopback(name) || (hasPort && dstPort == 53);
-                if (!allowUdp) {
-                    const int err = WSAEACCES;
-                    if (ShouldLogUdpBlock()) {
-                        const std::string api = isWsa ? "WSAConnect" : "connect";
-                        const std::string dst = SockaddrToString(name);
-                        Core::Logger::Warn(api + ": 已阻止 UDP 连接(策略: udp_mode=block, 说明: 禁用 QUIC/HTTP3), sock=" + std::to_string((unsigned long long)s) +
-                                           (dst.empty() ? "" : ", dst=" + dst) +
-                                           (hasPort ? (", port=" + std::to_string(dstPort)) : std::string("")) +
-                                           ", WSA错误码=" + std::to_string(err));
+            if (soType == SOCK_DGRAM) {
+                // UDP 强阻断：默认阻断 UDP（除 DNS/loopback 例外），强制应用回退到 TCP 再走代理
+                // 设计意图：解决国内环境 QUIC/HTTP3(UDP) 绕过代理导致“看似已建隧道但仍不可用”的问题。
+                if (config.rules.udp_mode == "block") {
+                    uint16_t dstPort = 0;
+                    const bool hasPort = TryGetSockaddrPort(name, &dstPort);
+                    const bool allowUdp = IsSockaddrLoopback(name) || (hasPort && dstPort == 53);
+                    if (!allowUdp) {
+                        const int err = WSAEACCES;
+                        if (ShouldLogUdpBlock()) {
+                            const std::string api = isWsa ? "WSAConnect" : "connect";
+                            const std::string dst = SockaddrToString(name);
+                            Core::Logger::Warn(api + ": 已阻止 UDP 连接(策略: udp_mode=block, 说明: 禁用 QUIC/HTTP3), sock=" + std::to_string((unsigned long long)s) +
+                                               (dst.empty() ? "" : ", dst=" + dst) +
+                                               (hasPort ? (", port=" + std::to_string(dstPort)) : std::string("")) +
+                                               ", WSA错误码=" + std::to_string(err));
+                        }
+                        WSASetLastError(err);
+                        return SOCKET_ERROR;
                     }
-                    WSASetLastError(err);
-                    return SOCKET_ERROR;
+                    if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
+                        const std::string dst = SockaddrToString(name);
+                        Core::Logger::Debug(std::string(isWsa ? "WSAConnect" : "connect") +
+                                            ": UDP 直连已放行(例外), sock=" + std::to_string((unsigned long long)s) +
+                                            (dst.empty() ? "" : ", dst=" + dst));
+                    }
+                    return isWsa ? fpWSAConnect(s, name, namelen, NULL, NULL, NULL, NULL) : fpConnect(s, name, namelen);
                 }
-                if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
-                    const std::string dst = SockaddrToString(name);
-                    Core::Logger::Debug(std::string(isWsa ? "WSAConnect" : "connect") +
-                                        ": UDP 直连已放行(例外), sock=" + std::to_string((unsigned long long)s) +
-                                        (dst.empty() ? "" : ", dst=" + dst));
+
+                // UDP 走代理：用于 QUIC/HTTP3（通过 SOCKS5 UDP Associate）
+                if (config.rules.udp_mode == "proxy") {
+                    return PerformProxyUdpConnect(s, name, namelen, isWsa);
                 }
+
+                // udp_mode=direct：保持直连
                 return isWsa ? fpWSAConnect(s, name, namelen, NULL, NULL, NULL, NULL) : fpConnect(s, name, namelen);
             }
 
-            // UDP 走代理：用于 QUIC/HTTP3（通过 SOCKS5 UDP Associate）
-            if (config.rules.udp_mode == "proxy") {
-                return PerformProxyUdpConnect(s, name, namelen, isWsa);
+            // 其他非 SOCK_STREAM 类型保持直连；仅在 Debug 下记录，避免刷屏影响性能
+            if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
+                const std::string dst = SockaddrToString(name);
+                Core::Logger::Debug(std::string(isWsa ? "WSAConnect" : "connect") +
+                                    ": 非 SOCK_STREAM 直连, sock=" + std::to_string((unsigned long long)s) +
+                                    ", soType=" + std::to_string(soType) +
+                                    (dst.empty() ? "" : ", dst=" + dst));
             }
-
-            // udp_mode=direct：保持直连
             return isWsa ? fpWSAConnect(s, name, namelen, NULL, NULL, NULL, NULL) : fpConnect(s, name, namelen);
         }
-
-        // 其他非 SOCK_STREAM 类型保持直连；仅在 Debug 下记录，避免刷屏影响性能
-        if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
-            const std::string dst = SockaddrToString(name);
-            Core::Logger::Debug(std::string(isWsa ? "WSAConnect" : "connect") +
-                                ": 非 SOCK_STREAM 直连, sock=" + std::to_string((unsigned long long)s) +
-                                ", soType=" + std::to_string(soType) +
-                                (dst.empty() ? "" : ", dst=" + dst));
-        }
-        return isWsa ? fpWSAConnect(s, name, namelen, NULL, NULL, NULL, NULL) : fpConnect(s, name, namelen);
     }
 
     if (name->sa_family == AF_INET6) {
@@ -1895,18 +1955,22 @@ int PerformProxyConnect(SOCKET s, const struct sockaddr* name, int namelen, bool
     const bool routeMatched = config.rules.MatchRouting(originalHost, addrIp, addrIsV6, originalPort, "tcp",
                                                         &routeAction, &routeRule);
     if (!routeAction.empty() && routeAction == "direct") {
-        Core::Logger::Info("[Route] direct" +
-                           std::string(routeMatched ? (" rule=" + routeRule) : " rule=(default)") +
-                           ", target=" + originalHost + ":" + std::to_string(originalPort));
+        if (ShouldLogRouteDecisionInfo()) {
+            Core::Logger::Info("[Route] direct" +
+                               std::string(routeMatched ? (" rule=" + routeRule) : " rule=(default)") +
+                               ", target=" + originalHost + ":" + std::to_string(originalPort));
+        }
         // CRIT-3: 若底层 sockaddr 仍为 FakeIP，则 direct 直连必失败；这里做兜底重解析
         sockaddr_storage realAddr{};
         int realLen = 0;
         bool wasFake = false;
         if (TryResolveDirectTargetFromFakeIp(name, originalHost, originalPort, &realAddr, &realLen, &wasFake)) {
             const std::string dst = SockaddrToString((sockaddr*)&realAddr);
-            Core::Logger::Info("[Route] direct: FakeIP 已重解析直连" +
-                               (dst.empty() ? std::string("") : (", addr=" + dst)) +
-                               ", target=" + originalHost + ":" + std::to_string(originalPort));
+            if (ShouldLogRouteDecisionInfo()) {
+                Core::Logger::Info("[Route] direct: FakeIP 已重解析直连" +
+                                   (dst.empty() ? std::string("") : (", addr=" + dst)) +
+                                   ", target=" + originalHost + ":" + std::to_string(originalPort));
+            }
             return isWsa ? fpWSAConnect(s, (sockaddr*)&realAddr, realLen, NULL, NULL, NULL, NULL)
                          : fpConnect(s, (sockaddr*)&realAddr, realLen);
         }
@@ -1917,36 +1981,46 @@ int PerformProxyConnect(SOCKET s, const struct sockaddr* name, int namelen, bool
         return isWsa ? fpWSAConnect(s, name, namelen, NULL, NULL, NULL, NULL)
                      : fpConnect(s, name, namelen);
     } else if (routeMatched) {
-        Core::Logger::Info("[Route] proxy rule=" + routeRule +
-                           ", target=" + originalHost + ":" + std::to_string(originalPort));
+        if (ShouldLogRouteDecisionInfo()) {
+            Core::Logger::Info("[Route] proxy rule=" + routeRule +
+                               ", target=" + originalHost + ":" + std::to_string(originalPort));
+        }
     }
     
     // ============= 智能路由决策 =============
     // ROUTE-1: DNS 端口特殊处理 (解决 DNS 超时问题)
     if (originalPort == 53) {
         if (config.rules.dns_mode == "direct" || config.rules.dns_mode.empty()) {
-            Core::Logger::Info("DNS 请求直连 (策略: direct), sock=" + std::to_string((unsigned long long)s) +
-                               ", 目标: " + originalHost + ":53");
+            if (ShouldLogRouteDecisionInfo()) {
+                Core::Logger::Info("DNS 请求直连 (策略: direct), sock=" + std::to_string((unsigned long long)s) +
+                                   ", 目标: " + originalHost + ":53");
+            }
             return isWsa ? fpWSAConnect(s, name, namelen, NULL, NULL, NULL, NULL) 
                          : fpConnect(s, name, namelen);
         }
         // dns_mode == "proxy" 则继续走后面的代理逻辑
-        Core::Logger::Info("DNS 请求走代理 (策略: proxy), sock=" + std::to_string((unsigned long long)s) +
-                           ", 目标: " + originalHost + ":53");
+        if (ShouldLogRouteDecisionInfo()) {
+            Core::Logger::Info("DNS 请求走代理 (策略: proxy), sock=" + std::to_string((unsigned long long)s) +
+                               ", 目标: " + originalHost + ":53");
+        }
     }
     
     // ROUTE-2: 端口白名单过滤
     if (!config.rules.IsPortAllowed(originalPort)) {
-        Core::Logger::Info("端口 " + std::to_string(originalPort) + " 不在白名单, sock=" + std::to_string((unsigned long long)s) +
-                           ", 直连: " + originalHost);
+        if (ShouldLogRouteDecisionInfo()) {
+            Core::Logger::Info("端口 " + std::to_string(originalPort) + " 不在白名单, sock=" + std::to_string((unsigned long long)s) +
+                               ", 直连: " + originalHost);
+        }
         return isWsa ? fpWSAConnect(s, name, namelen, NULL, NULL, NULL, NULL) 
                      : fpConnect(s, name, namelen);
     }
     
     // 如果配置了代理
     if (config.proxy.port != 0) {
-        Core::Logger::Info("正重定向 " + originalHost + ":" + std::to_string(originalPort) +
-                           " 到代理, sock=" + std::to_string((unsigned long long)s));
+        if (ShouldLogRouteDecisionInfo()) {
+            Core::Logger::Info("正重定向 " + originalHost + ":" + std::to_string(originalPort) +
+                               " 到代理, sock=" + std::to_string((unsigned long long)s));
+        }
         
         // 修改目标地址为代理服务器（按地址族构造）
         int result = 0;
@@ -2466,54 +2540,55 @@ BOOL PASCAL DetourConnectEx(
     sock.SetTimeouts(config.timeout.recv_ms, config.timeout.send_ms);
     
     // 仅对 TCP (SOCK_STREAM) 做代理，避免误伤 UDP/QUIC 等
-    if (config.proxy.port != 0 && !IsStreamSocket(s)) {
-        int soType = 0;
-        TryGetSocketType(s, &soType);
+    if (config.proxy.port != 0) {
+        const int soType = GetSocketTypeForProxyDecision(s);
+        if (soType != SOCK_STREAM) {
 
-        if (soType == SOCK_DGRAM) {
-            // UDP 强阻断：默认阻断 UDP（除 DNS/loopback 例外），强制应用回退到 TCP 再走代理
-            // 说明：ConnectEx 可能被 QUIC/HTTP3 等用于 UDP，这里需要覆盖其行为。
-            if (config.rules.udp_mode == "block") {
-                uint16_t dstPort = 0;
-                const bool hasPort = TryGetSockaddrPort(name, &dstPort);
-                const bool allowUdp = IsSockaddrLoopback(name) || (hasPort && dstPort == 53);
-                if (!allowUdp) {
-                    const int err = WSAEACCES;
-                    if (ShouldLogUdpBlock()) {
-                        const std::string dst = SockaddrToString(name);
-                        Core::Logger::Warn("ConnectEx: 已阻止 UDP 连接(策略: udp_mode=block, 说明: 禁用 QUIC/HTTP3), sock=" + std::to_string((unsigned long long)s) +
-                                           (dst.empty() ? "" : ", dst=" + dst) +
-                                           (hasPort ? (", port=" + std::to_string(dstPort)) : std::string("")) +
-                                           ", WSA错误码=" + std::to_string(err));
+            if (soType == SOCK_DGRAM) {
+                // UDP 强阻断：默认阻断 UDP（除 DNS/loopback 例外），强制应用回退到 TCP 再走代理
+                // 说明：ConnectEx 可能被 QUIC/HTTP3 等用于 UDP，这里需要覆盖其行为。
+                if (config.rules.udp_mode == "block") {
+                    uint16_t dstPort = 0;
+                    const bool hasPort = TryGetSockaddrPort(name, &dstPort);
+                    const bool allowUdp = IsSockaddrLoopback(name) || (hasPort && dstPort == 53);
+                    if (!allowUdp) {
+                        const int err = WSAEACCES;
+                        if (ShouldLogUdpBlock()) {
+                            const std::string dst = SockaddrToString(name);
+                            Core::Logger::Warn("ConnectEx: 已阻止 UDP 连接(策略: udp_mode=block, 说明: 禁用 QUIC/HTTP3), sock=" + std::to_string((unsigned long long)s) +
+                                               (dst.empty() ? "" : ", dst=" + dst) +
+                                               (hasPort ? (", port=" + std::to_string(dstPort)) : std::string("")) +
+                                               ", WSA错误码=" + std::to_string(err));
+                        }
+                        WSASetLastError(err);
+                        return FALSE;
                     }
-                    WSASetLastError(err);
-                    return FALSE;
+                    if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
+                        const std::string dst = SockaddrToString(name);
+                        Core::Logger::Debug("ConnectEx: UDP 直连已放行(例外), sock=" + std::to_string((unsigned long long)s) +
+                                            (dst.empty() ? "" : ", dst=" + dst));
+                    }
+                    return originalConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
                 }
-                if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
-                    const std::string dst = SockaddrToString(name);
-                    Core::Logger::Debug("ConnectEx: UDP 直连已放行(例外), sock=" + std::to_string((unsigned long long)s) +
-                                        (dst.empty() ? "" : ", dst=" + dst));
+
+                // UDP 走代理：通过 SOCKS5 UDP Associate 转发（用于 QUIC/HTTP3）
+                if (config.rules.udp_mode == "proxy") {
+                    return PerformProxyUdpConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped, originalConnectEx);
                 }
+
+                // udp_mode=direct：保持直连
                 return originalConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
             }
 
-            // UDP 走代理：通过 SOCKS5 UDP Associate 转发（用于 QUIC/HTTP3）
-            if (config.rules.udp_mode == "proxy") {
-                return PerformProxyUdpConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped, originalConnectEx);
+            // 其他非 SOCK_STREAM 类型保持直连；仅在 Debug 下记录，避免刷屏影响性能
+            if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
+                const std::string dst = SockaddrToString(name);
+                Core::Logger::Debug("ConnectEx: 非 SOCK_STREAM 直连, sock=" + std::to_string((unsigned long long)s) +
+                                    ", soType=" + std::to_string(soType) +
+                                    (dst.empty() ? "" : ", dst=" + dst));
             }
-
-            // udp_mode=direct：保持直连
             return originalConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
         }
-
-        // 其他非 SOCK_STREAM 类型保持直连；仅在 Debug 下记录，避免刷屏影响性能
-        if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
-            const std::string dst = SockaddrToString(name);
-            Core::Logger::Debug("ConnectEx: 非 SOCK_STREAM 直连, sock=" + std::to_string((unsigned long long)s) +
-                                ", soType=" + std::to_string(soType) +
-                                (dst.empty() ? "" : ", dst=" + dst));
-        }
-        return originalConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
     }
 
     if (name->sa_family == AF_INET6) {
@@ -2594,18 +2669,22 @@ BOOL PASCAL DetourConnectEx(
     const bool routeMatched = config.rules.MatchRouting(originalHost, addrIp, addrIsV6, originalPort, "tcp",
                                                         &routeAction, &routeRule);
     if (!routeAction.empty() && routeAction == "direct") {
-        Core::Logger::Info("[Route] direct" +
-                           std::string(routeMatched ? (" rule=" + routeRule) : " rule=(default)") +
-                           ", target=" + originalHost + ":" + std::to_string(originalPort));
+        if (ShouldLogRouteDecisionInfo()) {
+            Core::Logger::Info("[Route] direct" +
+                               std::string(routeMatched ? (" rule=" + routeRule) : " rule=(default)") +
+                               ", target=" + originalHost + ":" + std::to_string(originalPort));
+        }
         // CRIT-3: direct + FakeIP 兜底重解析，避免“直连虚拟地址”必失败
         sockaddr_storage realAddr{};
         int realLen = 0;
         bool wasFake = false;
         if (TryResolveDirectTargetFromFakeIp(name, originalHost, originalPort, &realAddr, &realLen, &wasFake)) {
             const std::string dst = SockaddrToString((sockaddr*)&realAddr);
-            Core::Logger::Info("[Route] direct: FakeIP 已重解析直连(ConnectEx)" +
-                               (dst.empty() ? std::string("") : (", addr=" + dst)) +
-                               ", target=" + originalHost + ":" + std::to_string(originalPort));
+            if (ShouldLogRouteDecisionInfo()) {
+                Core::Logger::Info("[Route] direct: FakeIP 已重解析直连(ConnectEx)" +
+                                   (dst.empty() ? std::string("") : (", addr=" + dst)) +
+                                   ", target=" + originalHost + ":" + std::to_string(originalPort));
+            }
             return originalConnectEx(s, (sockaddr*)&realAddr, realLen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
         }
         if (wasFake) {
@@ -2614,8 +2693,10 @@ BOOL PASCAL DetourConnectEx(
         }
         return originalConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
     } else if (routeMatched) {
-        Core::Logger::Info("[Route] proxy rule=" + routeRule +
-                           ", target=" + originalHost + ":" + std::to_string(originalPort));
+        if (ShouldLogRouteDecisionInfo()) {
+            Core::Logger::Info("[Route] proxy rule=" + routeRule +
+                               ", target=" + originalHost + ":" + std::to_string(originalPort));
+        }
     }
     
     if (config.proxy.port == 0) {
@@ -2626,24 +2707,32 @@ BOOL PASCAL DetourConnectEx(
     // ROUTE-1: DNS 端口特殊处理 (解决 DNS 超时问题)
     if (originalPort == 53) {
         if (config.rules.dns_mode == "direct" || config.rules.dns_mode.empty()) {
-            Core::Logger::Info("ConnectEx DNS 请求直连 (策略: direct), sock=" + std::to_string((unsigned long long)s) +
-                               ", 目标: " + originalHost + ":53");
+            if (ShouldLogRouteDecisionInfo()) {
+                Core::Logger::Info("ConnectEx DNS 请求直连 (策略: direct), sock=" + std::to_string((unsigned long long)s) +
+                                   ", 目标: " + originalHost + ":53");
+            }
             return originalConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
         }
         // dns_mode == "proxy" 则继续走后面的代理逻辑
-        Core::Logger::Info("ConnectEx DNS 请求走代理 (策略: proxy), sock=" + std::to_string((unsigned long long)s) +
-                           ", 目标: " + originalHost + ":53");
+        if (ShouldLogRouteDecisionInfo()) {
+            Core::Logger::Info("ConnectEx DNS 请求走代理 (策略: proxy), sock=" + std::to_string((unsigned long long)s) +
+                               ", 目标: " + originalHost + ":53");
+        }
     }
 
     // ROUTE-2: 端口白名单过滤
     if (!config.rules.IsPortAllowed(originalPort)) {
-        Core::Logger::Info("ConnectEx 端口 " + std::to_string(originalPort) + " 不在白名单, sock=" + std::to_string((unsigned long long)s) +
-                           ", 直连: " + originalHost);
+        if (ShouldLogRouteDecisionInfo()) {
+            Core::Logger::Info("ConnectEx 端口 " + std::to_string(originalPort) + " 不在白名单, sock=" + std::to_string((unsigned long long)s) +
+                               ", 直连: " + originalHost);
+        }
         return originalConnectEx(s, name, namelen, lpSendBuffer, dwSendDataLength, lpdwBytesSent, lpOverlapped);
     }
     
-    Core::Logger::Info("ConnectEx 正重定向 " + originalHost + ":" + std::to_string(originalPort) +
-                       " 到代理, sock=" + std::to_string((unsigned long long)s));
+    if (ShouldLogRouteDecisionInfo()) {
+        Core::Logger::Info("ConnectEx 正重定向 " + originalHost + ":" + std::to_string(originalPort) +
+                           " 到代理, sock=" + std::to_string((unsigned long long)s));
+    }
     
     DWORD ignoredBytes = 0;
     BOOL result = FALSE;

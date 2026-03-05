@@ -1,6 +1,8 @@
 #pragma once
 #include <winsock2.h>
 #include <ws2tcpip.h>
+#include <chrono>
+#include <limits>
 #include <string>
 #include <sstream>
 #include <iomanip>
@@ -27,7 +29,7 @@ namespace Network {
          * @param targetPort 目标端口
          * @return true 表示隧道建立成功
          */
-        static bool Handshake(SOCKET sock, const std::string& targetHost, uint16_t targetPort) {
+        static bool Handshake(SOCKET sock, const std::string& targetHost, uint16_t targetPort, int handshakeBudgetMs = -1) {
             if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
                 Core::Logger::Debug("HTTP CONNECT: 开始握手, sock=" + std::to_string((unsigned long long)sock) +
                                     ", 目标=" + targetHost + ":" + std::to_string(targetPort));
@@ -48,17 +50,36 @@ namespace Network {
             
             std::string requestStr = request.str();
             auto& config = Core::Config::Instance();
-            int recvTimeout = config.timeout.recv_ms;
-            int sendTimeout = config.timeout.send_ms;
+            const int recvTimeout = NormalizeTimeoutMs(config.timeout.recv_ms);
+            const int sendTimeout = NormalizeTimeoutMs(config.timeout.send_ms);
+            if (handshakeBudgetMs <= 0) {
+                handshakeBudgetMs = config.timeout.connect_ms + sendTimeout + recvTimeout;
+            }
+            if (handshakeBudgetMs <= 0) {
+                handshakeBudgetMs = sendTimeout + recvTimeout;
+            }
+            const auto deadline = BuildDeadline(handshakeBudgetMs);
+
+            auto stepTimeout = [&](int fallbackMs, const char* stage) -> int {
+                const int timeoutMs = RemainingTimeoutMs(deadline, fallbackMs);
+                if (timeoutMs <= 0) {
+                    Core::Logger::Error(std::string("HTTP CONNECT: ") + stage + " 握手预算耗尽, sock=" +
+                                        std::to_string((unsigned long long)sock));
+                }
+                return timeoutMs;
+            };
 
             if (Core::Logger::IsEnabled(Core::LogLevel::Debug)) {
                 Core::Logger::Debug("HTTP CONNECT: 发送请求, sock=" + std::to_string((unsigned long long)sock) +
-                                    ", line=\"" + FirstLine(requestStr) + "\"");
+                                    ", line=\"" + FirstLine(requestStr) + "\"" +
+                                    ", 预算=" + std::to_string(handshakeBudgetMs) + "ms");
             }
             
             // 发送 CONNECT 请求
             // 使用统一 IO 封装，兼容非阻塞套接字
-            if (!SocketIo::SendAll(sock, requestStr.c_str(), (int)requestStr.length(), sendTimeout)) {
+            const int sendStepTimeout = stepTimeout(sendTimeout, "发送请求");
+            if (sendStepTimeout <= 0) return false;
+            if (!SocketIo::SendAll(sock, requestStr.c_str(), (int)requestStr.length(), sendStepTimeout)) {
                 int err = WSAGetLastError();
                 Core::Logger::Error("HTTP CONNECT: 发送请求失败, sock=" + std::to_string((unsigned long long)sock) +
                                     ", WSA错误码=" + std::to_string(err) +
@@ -73,7 +94,9 @@ namespace Network {
             // 接收响应
             // HTTP 响应头格式: HTTP/1.x 200 ...\r\n...\r\n\r\n
             std::string response;
-            if (!SocketIo::RecvUntil(sock, &response, "\r\n\r\n", recvTimeout, 1024)) {
+            const int recvStepTimeout = stepTimeout(recvTimeout, "接收响应");
+            if (recvStepTimeout <= 0) return false;
+            if (!SocketIo::RecvUntil(sock, &response, "\r\n\r\n", recvStepTimeout, 1024)) {
                 int err = WSAGetLastError();
                 if (err == WSAEMSGSIZE) {
                     Core::Logger::Error("HTTP CONNECT: 响应头过长或不完整, sock=" + std::to_string((unsigned long long)sock));
@@ -115,6 +138,33 @@ namespace Network {
         }
         
     private:
+        static int NormalizeTimeoutMs(int timeoutMs) {
+            return timeoutMs > 0 ? timeoutMs : 5000;
+        }
+
+        static std::chrono::steady_clock::time_point BuildDeadline(int timeoutMs) {
+            return std::chrono::steady_clock::now() + std::chrono::milliseconds(NormalizeTimeoutMs(timeoutMs));
+        }
+
+        static int RemainingTimeoutMs(const std::chrono::steady_clock::time_point& deadline, int fallbackMs) {
+            const int fallback = NormalizeTimeoutMs(fallbackMs);
+            const auto now = std::chrono::steady_clock::now();
+            if (now >= deadline) {
+                WSASetLastError(WSAETIMEDOUT);
+                return 0;
+            }
+            const auto remainMs = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+            if (remainMs <= 0) {
+                WSASetLastError(WSAETIMEDOUT);
+                return 0;
+            }
+            if (remainMs > std::numeric_limits<int>::max()) {
+                return fallback;
+            }
+            const int remain = static_cast<int>(remainMs);
+            return remain < fallback ? remain : fallback;
+        }
+
         // 失败时输出少量字节摘要（避免刷屏/泄露敏感信息）
         static std::string HexDump(const uint8_t* data, size_t len, size_t maxBytes) {
             if (!data || len == 0 || maxBytes == 0) return "";

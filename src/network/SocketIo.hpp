@@ -2,10 +2,37 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <cstdint>
+#include <chrono>
+#include <limits>
 #include <string>
 
 namespace Network {
 namespace SocketIo {
+
+inline int NormalizeTimeoutMs(int timeoutMs) {
+    return timeoutMs > 0 ? timeoutMs : 5000;
+}
+
+inline std::chrono::steady_clock::time_point BuildDeadline(int timeoutMs) {
+    return std::chrono::steady_clock::now() + std::chrono::milliseconds(NormalizeTimeoutMs(timeoutMs));
+}
+
+inline int RemainingTimeoutMs(const std::chrono::steady_clock::time_point& deadline) {
+    const auto now = std::chrono::steady_clock::now();
+    if (now >= deadline) {
+        WSASetLastError(WSAETIMEDOUT);
+        return 0;
+    }
+    const auto remainMs = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now).count();
+    if (remainMs <= 0) {
+        WSASetLastError(WSAETIMEDOUT);
+        return 0;
+    }
+    if (remainMs > std::numeric_limits<int>::max()) {
+        return std::numeric_limits<int>::max();
+    }
+    return static_cast<int>(remainMs);
+}
 
 // 使用 select 等待可读/可写，避免非阻塞套接字直接失败
 inline bool WaitReadable(SOCKET sock, int timeoutMs) {
@@ -13,7 +40,7 @@ inline bool WaitReadable(SOCKET sock, int timeoutMs) {
         WSASetLastError(WSAEINVAL);
         return false;
     }
-    if (timeoutMs <= 0) timeoutMs = 5000;
+    timeoutMs = NormalizeTimeoutMs(timeoutMs);
     fd_set readSet;
     FD_ZERO(&readSet);
     FD_SET(sock, &readSet);
@@ -32,7 +59,7 @@ inline bool WaitWritable(SOCKET sock, int timeoutMs) {
         WSASetLastError(WSAEINVAL);
         return false;
     }
-    if (timeoutMs <= 0) timeoutMs = 5000;
+    timeoutMs = NormalizeTimeoutMs(timeoutMs);
     fd_set writeSet;
     FD_ZERO(&writeSet);
     FD_SET(sock, &writeSet);
@@ -62,6 +89,7 @@ inline bool WaitConnect(SOCKET sock, int timeoutMs) {
 
 // 确保完整发送，兼容非阻塞套接字
 inline bool SendAll(SOCKET sock, const char* data, int len, int timeoutMs) {
+    const auto deadline = BuildDeadline(timeoutMs);
     int totalSent = 0;
     while (totalSent < len) {
         int sent = send(sock, data + totalSent, len - totalSent, 0);
@@ -75,7 +103,9 @@ inline bool SendAll(SOCKET sock, const char* data, int len, int timeoutMs) {
         }
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS) {
-            if (!WaitWritable(sock, timeoutMs)) return false;
+            const int waitMs = RemainingTimeoutMs(deadline);
+            if (waitMs <= 0) return false;
+            if (!WaitWritable(sock, waitMs)) return false;
             continue;
         }
         return false;
@@ -85,6 +115,7 @@ inline bool SendAll(SOCKET sock, const char* data, int len, int timeoutMs) {
 
 // 精确接收指定字节数，兼容非阻塞套接字
 inline bool RecvExact(SOCKET sock, uint8_t* buf, int len, int timeoutMs) {
+    const auto deadline = BuildDeadline(timeoutMs);
     int totalRead = 0;
     while (totalRead < len) {
         int read = recv(sock, (char*)buf + totalRead, len - totalRead, 0);
@@ -98,7 +129,9 @@ inline bool RecvExact(SOCKET sock, uint8_t* buf, int len, int timeoutMs) {
         }
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS) {
-            if (!WaitReadable(sock, timeoutMs)) return false;
+            const int waitMs = RemainingTimeoutMs(deadline);
+            if (waitMs <= 0) return false;
+            if (!WaitReadable(sock, waitMs)) return false;
             continue;
         }
         return false;
@@ -113,6 +146,7 @@ inline bool RecvUntil(SOCKET sock, std::string* out, const std::string& delimite
         return false;
     }
     if (maxBytes <= 0) maxBytes = 1024;
+    const auto deadline = BuildDeadline(timeoutMs);
     out->clear();
     out->reserve((size_t)maxBytes);
     while ((int)out->size() < maxBytes) {
@@ -132,7 +166,9 @@ inline bool RecvUntil(SOCKET sock, std::string* out, const std::string& delimite
         }
         int err = WSAGetLastError();
         if (err == WSAEWOULDBLOCK || err == WSAEINPROGRESS) {
-            if (!WaitReadable(sock, timeoutMs)) return false;
+            const int waitMs = RemainingTimeoutMs(deadline);
+            if (waitMs <= 0) return false;
+            if (!WaitReadable(sock, waitMs)) return false;
             continue;
         }
         return false;

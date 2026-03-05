@@ -9,6 +9,7 @@
 #   .\build.ps1 -Config Debug -Arch x86
 # ============================================================
 
+[CmdletBinding()]
 param(
     [ValidateSet("Release", "Debug")]
     [string]$Config = "Release",
@@ -19,6 +20,7 @@ param(
     [switch]$StaticRuntime,
     [switch]$DynamicRuntime,
     [switch]$Clean,
+    [switch]$SkipTests,
     [switch]$Help
 )
 
@@ -67,6 +69,8 @@ Antigravity-Proxy 编译脚本
     -StaticRuntime           使用静态运行库 (/MT) (默认启用)
     -DynamicRuntime          使用动态运行库 (/MD)
     -Clean                   清理后重新编译
+    -SkipTests               跳过测试步骤（当前脚本默认不执行自动测试，此参数用于 CI 显式声明）
+    -Verbose                 输出详细构建日志（PowerShell 通用参数）
     -Help                    显示帮助信息
 
 示例:
@@ -75,6 +79,7 @@ Antigravity-Proxy 编译脚本
     .\build.ps1 -Arch x86            # Release x86 编译
     .\build.ps1 -DynamicRuntime      # 使用动态运行库编译
     .\build.ps1 -Clean -Config Debug # 清理后 Debug 编译
+    .\build.ps1 -Verbose             # 显示详细编译输出
 "@
 }
 
@@ -102,6 +107,7 @@ Write-Host "  配置: $Config" -ForegroundColor White
 Write-Host "  架构: $Arch" -ForegroundColor White
 Write-Host "  运行库: $RuntimeLabel" -ForegroundColor White
 Write-Host "  构建目录: $BuildDir" -ForegroundColor White
+Write-Host "  详细输出: $(if ($PSBoundParameters.ContainsKey('Verbose')) { '开启' } else { '关闭' })" -ForegroundColor White
 Write-Host ""
 
 # ============================================================
@@ -223,7 +229,14 @@ Write-Step "开始编译 ($Config $Arch)..."
 
 Push-Location $BuildDir
 try {
-    $buildResult = & cmake --build . --config $Config 2>&1
+    $buildArgs = @("--build", ".", "--config", $Config)
+    if ($PSBoundParameters.ContainsKey('Verbose')) {
+        $buildArgs += "--verbose"
+    }
+    $buildResult = & cmake @buildArgs 2>&1
+    if ($PSBoundParameters.ContainsKey('Verbose')) {
+        $buildResult | ForEach-Object { Write-Host $_ }
+    }
     if ($LASTEXITCODE -ne 0) {
         Write-Error "编译失败"
         Write-Host $buildResult -ForegroundColor Red
@@ -232,6 +245,16 @@ try {
     Write-Success "编译完成"
 } finally {
     Pop-Location
+}
+
+# ============================================================
+# 步骤 5.5: 测试提示（保持默认行为不变）
+# ============================================================
+
+if ($SkipTests) {
+    Write-Step "已按参数跳过测试步骤 (-SkipTests)"
+} else {
+    Write-Step "当前脚本默认不执行自动测试（如需验证可在构建目录手动运行 ctest）"
 }
 
 # ============================================================
@@ -278,7 +301,7 @@ $configJson = @{
         "arch" = $Arch
     }
     # 日志等级：默认 info（克制日志输出）；排障时可改为 debug 以获得更详细信息
-    log_level = "debug"
+    log_level = "info"
     proxy = @{
         host = "127.0.0.1"
         port = 7890
